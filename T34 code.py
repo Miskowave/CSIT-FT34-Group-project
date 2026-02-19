@@ -1,19 +1,3 @@
-# ============================================================
-# CSCI218 – Airplane Model Recognition (Google Colab Full Code)
-# - Mount Drive
-# - Unzip dataset (archive.zip) to Colab local
-# - Auto-find "crop" folder
-# - Build dataframe (file_path, label)
-# - Train/Val/Test split (70/21/9)
-# - Generators with fixed class mapping (prevents shape mismatch)
-# - CNN training + learning curves
-# - Test evaluation + classification report + confusion matrix (top20)
-# - Save outputs and model
-# ============================================================
-
-# -------------------------
-# 0) Mount Drive
-# -------------------------
 from google.colab import drive
 drive.mount('/content/drive')
 
@@ -39,10 +23,7 @@ OUT_DIR = "/content/output_figs"
 os.makedirs(OUT_DIR, exist_ok=True)
 
 
-# -------------------------
-# 1) Unzip dataset
-# -------------------------
-zip_path = "/content/drive/MyDrive/archive.zip"  # <-- change if your zip name differs
+zip_path = "/content/drive/MyDrive/archive.zip"
 extract_path = "/content/dataset"
 
 os.makedirs(extract_path, exist_ok=True)
@@ -55,9 +36,7 @@ print("Extracted to:", extract_path)
 print("Top-level items:", os.listdir(extract_path)[:20])
 
 
-# -------------------------
-# 2) Auto-find "crop" folder
-# -------------------------
+
 main_dir = None
 for root, dirs, files in os.walk(extract_path):
     if "crop" in dirs:
@@ -65,14 +44,11 @@ for root, dirs, files in os.walk(extract_path):
         break
 
 if main_dir is None:
-    raise FileNotFoundError("❌ Could not find a folder named 'crop' in the extracted dataset.")
+    raise FileNotFoundError("Could not find a folder named 'crop' in the extracted dataset.")
 
-print("✅ Found crop folder at:", main_dir)
+print("Found crop folder at:", main_dir)
 
 
-# -------------------------
-# 3) Build dataframe
-# -------------------------
 img_exts = (".jpg", ".jpeg", ".png", ".bmp", ".webp")
 
 paths, labels = [], []
@@ -87,12 +63,12 @@ for cls in class_folders:
 
 df = pd.DataFrame({"file_path": paths, "label": labels})
 
+# Quick dataset summary
 print("\nDataset summary:")
 print("Total images:", len(df))
 print("Total classes:", df["label"].nunique())
 print(df.head())
 
-# Class distribution quick stats + plot top-20 (optional but useful for report)
 counts = df["label"].value_counts()
 print("\nClass count min/median/max:", int(counts.min()), int(counts.median()), int(counts.max()))
 
@@ -106,9 +82,6 @@ plt.savefig(os.path.join(OUT_DIR, "dataset_top20_classes.png"), dpi=200)
 plt.show()
 
 
-# -------------------------
-# 4) Split train/val/test (70/21/9)
-# -------------------------
 train_df, tmp_df = train_test_split(df, test_size=0.30, random_state=7, shuffle=True)
 val_df, test_df  = train_test_split(tmp_df, test_size=0.30, random_state=7, shuffle=True)
 
@@ -116,15 +89,14 @@ print("\nSplit sizes:")
 print("Train:", len(train_df), " Val:", len(val_df), " Test:", len(test_df))
 
 
-# -------------------------
-# 5) Generators (fixed class mapping prevents shape mismatch)
-# -------------------------
+# Image loading settings
 IMG_SIZE = (224, 224)
 BATCH_SIZE = 64
 
-classes = sorted(df["label"].unique())  # fixed mapping across train/val/test
+# Fix class mapping so all generators use the same label order
+classes = sorted(df["label"].unique())
 
-train_datagen = ImageDataGenerator(rescale=1./255)  # you can add augmentation later
+train_datagen = ImageDataGenerator(rescale=1./255)
 valtest_datagen = ImageDataGenerator(rescale=1./255)
 
 train_gen = train_datagen.flow_from_dataframe(
@@ -151,17 +123,13 @@ test_gen = valtest_datagen.flow_from_dataframe(
     classes=classes, shuffle=False
 )
 
-# ✅ FIX for your error: use class_indices instead of num_classes
 print("\nGenerator classes:",
       len(train_gen.class_indices), len(val_gen.class_indices), len(test_gen.class_indices))
 
 num_classes = len(train_gen.class_indices)
-print("✅ num_classes =", num_classes)
+print("num_classes =", num_classes)
 
-
-# -------------------------
-# 6) Build CNN model
-# -------------------------
+# Build CNN model
 model = Sequential([
     Input(shape=(224,224,3)),
 
@@ -182,6 +150,7 @@ model = Sequential([
     Dense(num_classes, activation="softmax")
 ])
 
+# Compile model (training settings)
 LR = 0.001
 model.compile(
     optimizer=Adamax(learning_rate=LR),
@@ -195,12 +164,8 @@ model.summary()
 x_batch, y_batch = next(train_gen)
 print("\nBatch label shape:", y_batch.shape)
 print("Model output shape:", model.output_shape)
-# Expect: y_batch (64, num_classes) and model output (None, num_classes)
 
-
-# -------------------------
-# 7) Train (with callbacks)
-# -------------------------
+# Train model (with callbacks)
 EPOCHS = 10
 
 callbacks = [
@@ -218,9 +183,6 @@ history = model.fit(
 )
 
 
-# -------------------------
-# 8) Plot learning curves
-# -------------------------
 def plot_learning_curves(hist):
     tr_acc = hist.history["accuracy"]
     val_acc = hist.history["val_accuracy"]
@@ -259,12 +221,9 @@ def plot_learning_curves(hist):
 
 plot_learning_curves(history)
 
-
-# -------------------------
-# 9) Test evaluation + metrics
-# -------------------------
+# Evaluate on test set
 test_loss, test_acc = model.evaluate(test_gen, verbose=0)
-print("\n✅ TEST RESULTS")
+print("\nTEST RESULTS")
 print(f"Test loss: {test_loss:.4f}")
 print(f"Test accuracy: {test_acc:.4f}")
 
@@ -274,11 +233,10 @@ probs = model.predict(test_gen, verbose=0)
 y_pred = np.argmax(probs, axis=1)
 y_true = test_gen.classes
 
-# Top-5 accuracy (useful for many classes)
 top5 = top_k_accuracy_score(y_true, probs, k=5, labels=np.arange(num_classes))
 print(f"Top-5 accuracy: {top5:.4f}")
 
-# Classification report (macro/weighted averages)
+# Classification report
 report_text = classification_report(y_true, y_pred, target_names=classes, digits=4)
 print("\nClassification Report:")
 print(report_text)
@@ -287,7 +245,7 @@ with open(os.path.join(OUT_DIR, "classification_report.txt"), "w") as f:
     f.write(report_text)
 print("Saved:", os.path.join(OUT_DIR, "classification_report.txt"))
 
-# Confusion matrix (plot top-20 only)
+# Confusion matrix
 cm = confusion_matrix(y_true, y_pred)
 print("Confusion matrix shape:", cm.shape)
 
@@ -303,12 +261,9 @@ plt.savefig(os.path.join(OUT_DIR, "confusion_matrix_top20.png"), dpi=200)
 plt.show()
 
 
-# -------------------------
-# 10) Save model
-# -------------------------
 save_model_path = "/content/drive/MyDrive/aircraft_cnn_model.h5"
 model.save(save_model_path)
-print("\n✅ Model saved to:", save_model_path)
+print("\nModel saved to:", save_model_path)
 
-print("\n✅ Figures saved in:", OUT_DIR)
+print("\nFigures saved in:", OUT_DIR)
 print("Files:", os.listdir(OUT_DIR))
