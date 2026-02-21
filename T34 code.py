@@ -1,269 +1,136 @@
-from google.colab import drive
-drive.mount('/content/drive')
+#Airplane Recognition Comparison
 
-import os, zipfile, math
+
+from google.colab import drive
+import os, zipfile, random, cv2
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
-
-from sklearn.model_selection import train_test_split
-from sklearn.metrics import confusion_matrix, classification_report, top_k_accuracy_score
-
+import seaborn as sns
 import tensorflow as tf
-from tensorflow.keras.models import Sequential
-from tensorflow.keras.layers import Input, Conv2D, MaxPooling2D, Flatten, Dense, Dropout
-from tensorflow.keras.optimizers import Adamax
-from tensorflow.keras.preprocessing.image import ImageDataGenerator
+from tensorflow.keras import layers
 from tensorflow.keras.callbacks import EarlyStopping, ReduceLROnPlateau, ModelCheckpoint
+from sklearn.model_selection import train_test_split
+from sklearn.metrics import precision_recall_fscore_support, top_k_accuracy_score, confusion_matrix, classification_report
 
-print("TensorFlow:", tf.__version__)
-print("GPU devices:", tf.config.list_physical_devices('GPU'))
+drive.mount('/content/drive')
 
-OUT_DIR = "/content/output_figs"
-os.makedirs(OUT_DIR, exist_ok=True)
+# DATASET SETUP
+ZIP_PATH = "/content/drive/MyDrive/Aircraft Image Dataset.zip"
+EXTRACT_PATH = "/content/dataset"
+os.makedirs(EXTRACT_PATH, exist_ok=True)
 
+with zipfile.ZipFile(ZIP_PATH, "r") as z:
+    z.extractall(EXTRACT_PATH)
 
-zip_path = "/content/drive/MyDrive/archive.zip"
-extract_path = "/content/dataset"
+# Auto-detect class folders
+def find_class_root(path):
+    for root, dirs, files in os.walk(path):
+        for d in dirs:
+            cand = os.path.join(root, d)
+            subs = [x for x in os.listdir(cand) if os.path.isdir(os.path.join(cand,x))]
+            if len(subs) >= 2: return cand
+    return None
 
-os.makedirs(extract_path, exist_ok=True)
+MAIN_DIR = find_class_root(EXTRACT_PATH)
+classes = sorted([d for d in os.listdir(MAIN_DIR) if os.path.isdir(os.path.join(MAIN_DIR,d))])
+num_classes = len(classes)
 
-print("\nUnzipping dataset...")
-with zipfile.ZipFile(zip_path, 'r') as z:
-    z.extractall(extract_path)
-
-print("Extracted to:", extract_path)
-print("Top-level items:", os.listdir(extract_path)[:20])
-
-
-
-main_dir = None
-for root, dirs, files in os.walk(extract_path):
-    if "crop" in dirs:
-        main_dir = os.path.join(root, "crop")
-        break
-
-if main_dir is None:
-    raise FileNotFoundError("Could not find a folder named 'crop' in the extracted dataset.")
-
-print("Found crop folder at:", main_dir)
-
-
-img_exts = (".jpg", ".jpeg", ".png", ".bmp", ".webp")
-
+# STRATIFIED SPLIT (70/20/10)
 paths, labels = [], []
-class_folders = sorted([d for d in os.listdir(main_dir) if os.path.isdir(os.path.join(main_dir, d))])
-
-for cls in class_folders:
-    cls_dir = os.path.join(main_dir, cls)
+for cls in classes:
+    cls_dir = os.path.join(MAIN_DIR, cls)
     for f in os.listdir(cls_dir):
-        if f.lower().endswith(img_exts):
+        if f.lower().endswith((".jpg",".png",".jpeg")):
             paths.append(os.path.join(cls_dir, f))
             labels.append(cls)
 
 df = pd.DataFrame({"file_path": paths, "label": labels})
+label_to_idx = {c:i for i,c in enumerate(classes)}
 
-# Quick dataset summary
-print("\nDataset summary:")
-print("Total images:", len(df))
-print("Total classes:", df["label"].nunique())
-print(df.head())
+train_df, temp_df = train_test_split(df, test_size=0.30, random_state=7, stratify=df["label"])
+val_df, test_df = train_test_split(temp_df, test_size=1/3, random_state=7, stratify=temp_df["label"])
 
-counts = df["label"].value_counts()
-print("\nClass count min/median/max:", int(counts.min()), int(counts.median()), int(counts.max()))
-
-plt.figure(figsize=(10,5))
-counts.head(20).plot(kind="bar")
-plt.title("Top 20 Classes by Image Count")
-plt.xlabel("Class")
-plt.ylabel("Images")
-plt.tight_layout()
-plt.savefig(os.path.join(OUT_DIR, "dataset_top20_classes.png"), dpi=200)
-plt.show()
-
-
-train_df, tmp_df = train_test_split(df, test_size=0.30, random_state=7, shuffle=True)
-val_df, test_df  = train_test_split(tmp_df, test_size=0.30, random_state=7, shuffle=True)
-
-print("\nSplit sizes:")
-print("Train:", len(train_df), " Val:", len(val_df), " Test:", len(test_df))
-
-
-# Image loading settings
+# TF.DATA PIPELINE
 IMG_SIZE = (224, 224)
-BATCH_SIZE = 64
+BATCH_SIZE = 32
 
-# Fix class mapping so all generators use the same label order
-classes = sorted(df["label"].unique())
+def make_ds(dataframe, training=False):
+    def load_img(path, label):
+        img = tf.io.read_file(path)
+        img = tf.image.decode_image(img, channels=3, expand_animations=False)
+        img = tf.image.resize(img, IMG_SIZE)
+        img = tf.cast(img, tf.float32)
+        return img, tf.one_hot(label, num_classes)
 
-train_datagen = ImageDataGenerator(rescale=1./255)
-valtest_datagen = ImageDataGenerator(rescale=1./255)
+    ds = tf.data.Dataset.from_tensor_slices((dataframe["file_path"].values, dataframe["label"].map(label_to_idx).values))
+    ds = ds.map(load_img, num_parallel_calls=tf.data.AUTOTUNE)
+    if training:
+        aug = tf.keras.Sequential([layers.RandomFlip("horizontal"), layers.RandomRotation(0.1)])
+        ds = ds.map(lambda x,y: (aug(x, training=True), y))
+    return ds.batch(BATCH_SIZE).prefetch(tf.data.AUTOTUNE)
 
-train_gen = train_datagen.flow_from_dataframe(
-    train_df,
-    x_col="file_path", y_col="label",
-    target_size=IMG_SIZE, color_mode="rgb",
-    class_mode="categorical", batch_size=BATCH_SIZE,
-    classes=classes, shuffle=True
-)
+train_ds = make_ds(train_df, training=True)
+val_ds = make_ds(val_df)
+test_ds = make_ds(test_df)
 
-val_gen = valtest_datagen.flow_from_dataframe(
-    val_df,
-    x_col="file_path", y_col="label",
-    target_size=IMG_SIZE, color_mode="rgb",
-    class_mode="categorical", batch_size=BATCH_SIZE,
-    classes=classes, shuffle=False
-)
+# MODEL BUILDERS
+def build_simple_cnn():
+    model = tf.keras.Sequential([
+        layers.Input(shape=(224,224,3)),
+        layers.Rescaling(1./255),
+        layers.Conv2D(32, 3, activation="relu"), layers.MaxPooling2D(),
+        layers.Conv2D(64, 3, activation="relu"), layers.MaxPooling2D(),
+        layers.Flatten(), layers.Dense(128, activation="relu"),
+        layers.Dense(num_classes, activation="softmax")
+    ])
+    return model
 
-test_gen = valtest_datagen.flow_from_dataframe(
-    test_df,
-    x_col="file_path", y_col="label",
-    target_size=IMG_SIZE, color_mode="rgb",
-    class_mode="categorical", batch_size=BATCH_SIZE,
-    classes=classes, shuffle=False
-)
+def build_efficientnet():
+    base = tf.keras.applications.EfficientNetB0(include_top=False, weights="imagenet", input_shape=(224,224,3))
+    base.trainable = False
+    inputs = layers.Input(shape=(224,224,3))
+    x = tf.keras.applications.efficientnet.preprocess_input(inputs)
+    x = base(x, training=False)
+    x = layers.GlobalAveragePooling2D()(x)
+    x = layers.Dense(num_classes, activation="softmax")(x)
+    return tf.keras.Model(inputs, outputs=x), base
 
-print("\nGenerator classes:",
-      len(train_gen.class_indices), len(val_gen.class_indices), len(test_gen.class_indices))
+# GRAD-CAM
+def get_gradcam(model, img_array, class_idx):
+    grad_model = tf.keras.models.Model([model.inputs], [model.get_layer("efficientnetb0").output, model.output])
+    with tf.GradientTape() as tape:
+        last_conv_output, preds = grad_model(img_array)
+        loss = preds[:, class_idx]
+    grads = tape.gradient(loss, last_conv_output)
+    pooled_grads = tf.reduce_mean(grads, axis=(0, 1, 2))
+    heatmap = last_conv_output[0] @ pooled_grads[..., tf.newaxis]
+    heatmap = tf.squeeze(tf.maximum(heatmap, 0) / tf.math.reduce_max(heatmap)).numpy()
+    return heatmap
 
-num_classes = len(train_gen.class_indices)
-print("num_classes =", num_classes)
+# TRAINING & EVALUATION HELPER
+def train_and_eval(model, name, fine_tune_base=None):
+    model.compile(optimizer='adam', loss='categorical_crossentropy', metrics=['accuracy'])
+    model.fit(train_ds, validation_data=val_ds, epochs=5, verbose=1)
 
-# Build CNN model
-model = Sequential([
-    Input(shape=(224,224,3)),
+    if fine_tune_base:
+        fine_tune_base.trainable = True
+        model.compile(optimizer=tf.keras.optimizers.Adam(1e-5), loss='categorical_crossentropy', metrics=['accuracy'])
+        model.fit(train_ds, validation_data=val_ds, epochs=3, verbose=1)
 
-    Conv2D(128, (3,3), activation="relu"),
-    MaxPooling2D(2,2),
+    probs = model.predict(test_ds)
+    y_pred = np.argmax(probs, axis=1)
+    y_true = np.concatenate([np.argmax(y.numpy(), axis=1) for _, y in test_ds])
 
-    Conv2D(64, (3,3), activation="relu"),
-    MaxPooling2D(2,2),
+    print(f"\n{name} Results:")
+    print(classification_report(y_true, y_pred, target_names=classes))
+    return y_true, y_pred
 
-    Conv2D(32, (3,3), activation="relu"),
-    MaxPooling2D(2,2),
+# EXECUTION
+cnn_true, cnn_pred = train_and_eval(build_simple_cnn(), "Simple CNN")
+eff_model, eff_base = build_efficientnet()
+eff_true, eff_pred = train_and_eval(eff_model, "EfficientNetB0", fine_tune_base=eff_base)
 
-    Flatten(),
-    Dense(128, activation="relu"),
-    Dropout(0.3),
-    Dense(64, activation="relu"),
-    Dense(32, activation="relu"),
-    Dense(num_classes, activation="softmax")
-])
-
-# Compile model (training settings)
-LR = 0.001
-model.compile(
-    optimizer=Adamax(learning_rate=LR),
-    loss="categorical_crossentropy",
-    metrics=["accuracy"]
-)
-
-model.summary()
-
-# Quick shape check to avoid mismatch
-x_batch, y_batch = next(train_gen)
-print("\nBatch label shape:", y_batch.shape)
-print("Model output shape:", model.output_shape)
-
-# Train model (with callbacks)
-EPOCHS = 10
-
-callbacks = [
-    EarlyStopping(monitor="val_loss", patience=3, restore_best_weights=True),
-    ReduceLROnPlateau(monitor="val_loss", factor=0.5, patience=2, verbose=1),
-    ModelCheckpoint("/content/best_model.keras", monitor="val_loss", save_best_only=True, verbose=1)
-]
-
-history = model.fit(
-    train_gen,
-    epochs=EPOCHS,
-    validation_data=val_gen,
-    callbacks=callbacks,
-    verbose=2
-)
-
-
-def plot_learning_curves(hist):
-    tr_acc = hist.history["accuracy"]
-    val_acc = hist.history["val_accuracy"]
-    tr_loss = hist.history["loss"]
-    val_loss = hist.history["val_loss"]
-
-    best_loss_epoch = int(np.argmin(val_loss)) + 1
-    best_acc_epoch  = int(np.argmax(val_acc)) + 1
-    epochs = np.arange(1, len(tr_acc) + 1)
-
-    plt.figure(figsize=(14,5))
-
-    plt.subplot(1,2,1)
-    plt.plot(epochs, tr_loss, label="Train loss")
-    plt.plot(epochs, val_loss, label="Val loss")
-    plt.scatter(best_loss_epoch, val_loss[best_loss_epoch-1], s=120,
-                label=f"Best val loss epoch={best_loss_epoch}")
-    plt.title("Training vs Validation Loss")
-    plt.xlabel("Epoch")
-    plt.ylabel("Loss")
-    plt.legend()
-
-    plt.subplot(1,2,2)
-    plt.plot(epochs, tr_acc, label="Train acc")
-    plt.plot(epochs, val_acc, label="Val acc")
-    plt.scatter(best_acc_epoch, val_acc[best_acc_epoch-1], s=120,
-                label=f"Best val acc epoch={best_acc_epoch}")
-    plt.title("Training vs Validation Accuracy")
-    plt.xlabel("Epoch")
-    plt.ylabel("Accuracy")
-    plt.legend()
-
-    plt.tight_layout()
-    plt.savefig(os.path.join(OUT_DIR, "learning_curves.png"), dpi=200)
-    plt.show()
-
-plot_learning_curves(history)
-
-# Evaluate on test set
-test_loss, test_acc = model.evaluate(test_gen, verbose=0)
-print("\nTEST RESULTS")
-print(f"Test loss: {test_loss:.4f}")
-print(f"Test accuracy: {test_acc:.4f}")
-
-# Predict probabilities
-test_gen.reset()
-probs = model.predict(test_gen, verbose=0)
-y_pred = np.argmax(probs, axis=1)
-y_true = test_gen.classes
-
-top5 = top_k_accuracy_score(y_true, probs, k=5, labels=np.arange(num_classes))
-print(f"Top-5 accuracy: {top5:.4f}")
-
-# Classification report
-report_text = classification_report(y_true, y_pred, target_names=classes, digits=4)
-print("\nClassification Report:")
-print(report_text)
-
-with open(os.path.join(OUT_DIR, "classification_report.txt"), "w") as f:
-    f.write(report_text)
-print("Saved:", os.path.join(OUT_DIR, "classification_report.txt"))
-
-# Confusion matrix
-cm = confusion_matrix(y_true, y_pred)
-print("Confusion matrix shape:", cm.shape)
-
-show_n = min(20, num_classes)
-plt.figure(figsize=(8,7))
-plt.imshow(cm[:show_n, :show_n])
-plt.title(f"Confusion Matrix (Top {show_n} classes)")
-plt.xlabel("Predicted")
-plt.ylabel("True")
-plt.colorbar()
-plt.tight_layout()
-plt.savefig(os.path.join(OUT_DIR, "confusion_matrix_top20.png"), dpi=200)
+# Confusion Matrix for Final Model
+sns.heatmap(confusion_matrix(eff_true, eff_pred), annot=True, xticklabels=classes, yticklabels=classes)
 plt.show()
-
-
-save_model_path = "/content/drive/MyDrive/aircraft_cnn_model.h5"
-model.save(save_model_path)
-print("\nModel saved to:", save_model_path)
-
-print("\nFigures saved in:", OUT_DIR)
-print("Files:", os.listdir(OUT_DIR))
